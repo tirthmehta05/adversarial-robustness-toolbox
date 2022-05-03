@@ -30,11 +30,14 @@ import numpy as np
 from art.config import ART_NUMPY_DTYPE
 from art.estimators.classification.pytorch import PyTorchClassifier
 from art.estimators.certification.randomized_smoothing.randomized_smoothing import RandomizedSmoothingMixin
+import art.estimators.certification.randomized_smoothing.smooth_adversarial.train_smoothadv as trainSmoothAdversarial
+import art.estimators.certification.randomized_smoothing.macer.train_macer as trainMacer
+from art.defences.preprocessor.gaussian_augmentation import GaussianAugmentation
+from art.attacks.evasion.iterative_method import BasicIterativeMethod
+import torch
 
 if TYPE_CHECKING:
     # pylint: disable=C0412
-    import torch
-
     from art.utils import CLIP_VALUES_TYPE, PREPROCESSING_TYPE
     from art.defences.preprocessor import Preprocessor
     from art.defences.postprocessor import Postprocessor
@@ -59,6 +62,8 @@ class PyTorchRandomizedSmoothing(RandomizedSmoothingMixin, PyTorchClassifier):
         input_shape: Tuple[int, ...],
         nb_classes: int,
         optimizer: Optional["torch.optim.Optimizer"] = None,  # type: ignore
+        scheduler: Optional["torch.optim.lr_scheduler"] = None,  # type: ignore
+        #attacker: Optional["art.estimators.certification.randomized_smoothing.smoothadvattack"] = None,
         channels_first: bool = True,
         clip_values: Optional["CLIP_VALUES_TYPE"] = None,
         preprocessing_defences: Union["Preprocessor", List["Preprocessor"], None] = None,
@@ -68,6 +73,17 @@ class PyTorchRandomizedSmoothing(RandomizedSmoothingMixin, PyTorchClassifier):
         sample_size: int = 32,
         scale: float = 0.1,
         alpha: float = 0.001,
+        num_noise_vec: int = 1,
+        train_multi_noise: bool = False,
+        attack_type: str ="PGD",
+        epsilon: float  =64.0,
+        num_steps: int =10,
+        warmup:int = 1,
+        lbd: float = 12.0,
+        gamma: float = 8.0,
+        beta: float = 16.0,
+        gauss_num: int = 16,
+        **kwargs
     ):
         """
         Create a randomized smoothing classifier.
@@ -109,15 +125,36 @@ class PyTorchRandomizedSmoothing(RandomizedSmoothingMixin, PyTorchClassifier):
             sample_size=sample_size,
             scale=scale,
             alpha=alpha,
+            num_noise_vec=num_noise_vec,
+            train_multi_noise=train_multi_noise,
+            attack_type=attack_type,
+            epsilon=epsilon,
+            num_steps=num_steps,
+            warmup=warmup,
+            lbd=lbd,
+            gamma=gamma,
+            beta=beta,
+            gauss_num = gauss_num,
+            **kwargs
         )
+        self.scheduler = scheduler
+        #self.attacker = attacker
 
     def _predict_classifier(self, x: np.ndarray, batch_size: int, training_mode: bool, **kwargs) -> np.ndarray:
         x = x.astype(ART_NUMPY_DTYPE)
         return PyTorchClassifier.predict(self, x=x, batch_size=batch_size, training_mode=training_mode, **kwargs)
 
-    def _fit_classifier(self, x: np.ndarray, y: np.ndarray, batch_size: int, nb_epochs: int, **kwargs) -> None:
-        x = x.astype(ART_NUMPY_DTYPE)
-        return PyTorchClassifier.fit(self, x, y, batch_size=batch_size, nb_epochs=nb_epochs, **kwargs)
+    def _fit_classifier(self, x: np.ndarray, y: np.ndarray, batch_size: int, nb_epochs: int, train_method: str, **kwargs) -> None:
+        print('scale is {} and train method is {} and batch size is {}'.format(self.scale, train_method, batch_size))
+        if train_method == 'smoothadv':
+          return trainSmoothAdversarial.fit_pytorch(self, x, y, batch_size, nb_epochs, **kwargs)
+        elif train_method == 'macer':
+          return trainMacer.fit_pytorch(self, x, y, batch_size, nb_epochs, **kwargs)
+        else:
+          g_a = GaussianAugmentation(sigma=self.scale, augmentation=False)
+          x_rs, _ = g_a(x)
+          x_rs = x_rs.astype(ART_NUMPY_DTYPE)
+          return PyTorchClassifier.fit(self, x_rs, y, batch_size=batch_size, nb_epochs=nb_epochs, **kwargs)
 
     def fit(  # pylint: disable=W0221
         self,
@@ -242,3 +279,12 @@ class PyTorchRandomizedSmoothing(RandomizedSmoothingMixin, PyTorchClassifier):
                  `(batch_size, 1, input_shape)` when `label` parameter is specified.
         """
         raise NotImplementedError
+    
+    def _requires_grad_(self, model:torch.nn.Module, requires_grad:bool) -> None:
+      for param in model.parameters():
+          param.requires_grad_(requires_grad)
+    
+    def _get_minibatches(self, X, y, num_batches):
+      batch_size = len(X) // num_batches
+      for i in range(num_batches):
+          yield X[i*batch_size : (i+1)*batch_size], y[i*batch_size : (i+1)*batch_size]
